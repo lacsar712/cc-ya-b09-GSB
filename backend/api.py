@@ -7,7 +7,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from quart import Quart, jsonify, request
 
-from db import SCHEMA, connect
+from db import connect, ensure_schema
 from rules import judge
 
 SECRET = os.environ.get("JWT_SECRET", "yaw-align-dev-secret")
@@ -36,7 +36,7 @@ async def run_db(fn, *args, **kwargs):
 
 
 def seed_if_empty(conn):
-    conn.execute(SCHEMA)
+    ensure_schema(conn)
     count = conn.execute("SELECT COUNT(*) AS n FROM yaw_logs").fetchone()["n"]
     if count > 0:
         return
@@ -106,10 +106,62 @@ def require_writer(handler):
         if user is None:
             return jsonify({"detail": "未登录"}), 401
         if user["role"] != "writer":
-            return jsonify({"detail": "仅现场技师可提交偏航记录"}), 403
+            return jsonify({"detail": "仅现场技师可执行此操作"}), 403
         return await handler(user, *args, **kwargs)
 
     return wrapper
+
+
+# 峰值只允许在后台从办结集合（status='done'）重算：取每台机组 |误差| 最大
+# 的一条，峰值时刻即该记录的办结时刻。前端不得自行比大小。
+DONE_PEAKS_CTE = """
+WITH done_peaks AS (
+    SELECT DISTINCT ON (turbine_code)
+        turbine_code,
+        ABS(yaw_err_deg) AS peak_abs_deg,
+        processed_at AS peak_at
+    FROM yaw_logs
+    WHERE status = 'done'
+    ORDER BY turbine_code, ABS(yaw_err_deg) DESC, processed_at ASC, id ASC
+)
+"""
+
+# 峰值墙：左列机组，右列未锁峰值与已锁副本。没有办结记录的机组峰值列为 NULL，
+# 由前端显示「—」，不得虚填。
+PEAK_WALL_SQL = (
+    DONE_PEAKS_CTE
+    + """
+SELECT t.turbine_code,
+       dp.peak_abs_deg AS live_peak_deg,
+       dp.peak_at AS live_peak_at,
+       pl.peak_abs_deg AS locked_peak_deg,
+       pl.peak_at AS locked_peak_at,
+       pl.locked_at AS locked_at,
+       pl.locked_by AS locked_by
+FROM (SELECT DISTINCT turbine_code FROM yaw_logs) t
+LEFT JOIN done_peaks dp ON dp.turbine_code = t.turbine_code
+LEFT JOIN peak_locks pl ON pl.turbine_code = t.turbine_code
+ORDER BY t.turbine_code
+"""
+)
+
+# 锁定：把这一刻从办结集合重算出的峰值与时点写入锁区。ON CONFLICT DO NOTHING
+# 保证已锁列数字永不再变；之后的新办结只影响未锁列。
+LOCK_PEAKS_SQL = (
+    DONE_PEAKS_CTE
+    + """
+INSERT INTO peak_locks (turbine_code, peak_abs_deg, peak_at, locked_at, locked_by)
+SELECT turbine_code, peak_abs_deg, peak_at, %s, %s
+FROM done_peaks
+ON CONFLICT (turbine_code) DO NOTHING
+RETURNING turbine_code
+"""
+)
+
+
+def fetch_peak_wall():
+    with connect() as conn:
+        return conn.execute(PEAK_WALL_SQL).fetchall()
 
 
 @app.get("/api/health")
@@ -185,3 +237,29 @@ async def create_log(user):
 
     row = await run_db(insert)
     return jsonify(row), 201
+
+
+@app.get("/api/peaks")
+@require_login
+async def peak_wall(user):
+    rows = await run_db(fetch_peak_wall)
+    return jsonify({"rows": rows})
+
+
+@app.post("/api/peaks/lock")
+@require_writer
+async def lock_peaks(user):
+    # 请求体被刻意忽略：峰值只能由后台从办结集合重算，前端不得上送数值。
+    now = datetime.now(timezone.utc)
+
+    def lock():
+        with connect() as conn:
+            inserted = conn.execute(
+                LOCK_PEAKS_SQL, (now, user["username"])
+            ).fetchall()
+            conn.commit()
+            return len(inserted)
+
+    newly_locked = await run_db(lock)
+    rows = await run_db(fetch_peak_wall)
+    return jsonify({"newly_locked": newly_locked, "rows": rows})
