@@ -25,4 +25,12 @@ CREATE TABLE IF NOT EXISTS yaw_logs (
     created_at timestamptz NOT NULL,
     processed_at timestamptz
 );
+
+CREATE TABLE IF NOT EXISTS peak_locks (
+    turbine_code text PRIMARY KEY,
+    peak_deg double precision NOT NULL,
+    peak_at timestamptz NOT NULL,
+    locked_by text NOT NULL,
+    locked_at timestamptz NOT NULL
+);
 """

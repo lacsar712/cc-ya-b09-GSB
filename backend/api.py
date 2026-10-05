@@ -185,3 +185,116 @@ async def create_log(user):
 
     row = await run_db(insert)
     return jsonify(row), 201
+
+
+# 仅从「办结」集合重算各机组历史峰值：前端不得自行比大小，
+# 只有 pending（未办结）记录的机组不产生峰值行，由左连接补 NULL。
+PEAKS_SQL = """
+WITH done_peaks AS (
+    SELECT DISTINCT ON (turbine_code)
+           turbine_code,
+           abs(yaw_err_deg) AS peak_deg,
+           processed_at AS peak_at
+    FROM yaw_logs
+    WHERE status = 'done'
+    ORDER BY turbine_code, abs(yaw_err_deg) DESC, id DESC
+),
+turbines AS (
+    SELECT DISTINCT turbine_code FROM yaw_logs
+)
+SELECT t.turbine_code,
+       dp.peak_deg,
+       dp.peak_at,
+       pl.peak_deg  AS locked_peak_deg,
+       pl.peak_at    AS locked_peak_at,
+       pl.locked_by,
+       pl.locked_at,
+       (pl.turbine_code IS NOT NULL) AS locked
+FROM turbines t
+LEFT JOIN done_peaks dp ON dp.turbine_code = t.turbine_code
+LEFT JOIN peak_locks pl ON pl.turbine_code = t.turbine_code
+ORDER BY t.turbine_code
+"""
+
+
+@app.get("/api/peaks")
+@require_login
+async def list_peaks(user):
+    """峰值锁副本墙：左列机组，右列后台重算的峰值与时刻，及锁定副本。"""
+
+    def query():
+        with connect() as conn:
+            return conn.execute(PEAKS_SQL).fetchall()
+
+    rows = await run_db(query)
+    return jsonify(rows)
+
+
+@app.post("/api/peaks/lock")
+@require_writer
+async def lock_peaks(user):
+    """把「那一刻」后台重算出的峰值与时刻写入锁区。
+
+    - 不传 turbine_code：锁定所有「有办结记录且尚未锁定」的机组；
+    - 指定 turbine_code：锁定单台，无办结记录报 400，已锁定报 409。
+    已锁列通过 ON CONFLICT DO NOTHING 冻结，任何新办结都不再改写。
+    """
+    body = await request.get_json(force=True, silent=True) or {}
+    turbine_code = (body.get("turbine_code") or "").strip() or None
+    now = datetime.now(timezone.utc)
+
+    def do_lock():
+        with connect() as conn:
+            if turbine_code is not None:
+                exists = conn.execute(
+                    "SELECT 1 FROM peak_locks WHERE turbine_code = %s",
+                    (turbine_code,),
+                ).fetchone()
+                if exists is not None:
+                    return 409, {"detail": f"机组 {turbine_code} 已锁定，锁区数字不再改变"}
+                row = conn.execute(
+                    """INSERT INTO peak_locks
+                           (turbine_code, peak_deg, peak_at, locked_by, locked_at)
+                       SELECT turbine_code, peak_deg, peak_at, %s, %s
+                       FROM (
+                           SELECT DISTINCT ON (turbine_code)
+                                  turbine_code,
+                                  abs(yaw_err_deg) AS peak_deg,
+                                  processed_at AS peak_at
+                           FROM yaw_logs
+                           WHERE status = 'done' AND turbine_code = %s
+                           ORDER BY turbine_code, abs(yaw_err_deg) DESC, id DESC
+                       ) dp
+                       ON CONFLICT (turbine_code) DO NOTHING
+                       RETURNING turbine_code""",
+                    (user["username"], now, turbine_code),
+                ).fetchone()
+                if row is None:
+                    conn.rollback()
+                    return 400, {"detail": f"机组 {turbine_code} 暂无办结记录，不能锁定峰值"}
+                conn.commit()
+                return 200, {"locked": [row["turbine_code"]]}
+
+            inserted = conn.execute(
+                """INSERT INTO peak_locks
+                       (turbine_code, peak_deg, peak_at, locked_by, locked_at)
+                   SELECT DISTINCT ON (l.turbine_code)
+                          l.turbine_code,
+                          abs(l.yaw_err_deg),
+                          l.processed_at,
+                          %s, %s
+                   FROM yaw_logs l
+                   WHERE l.status = 'done'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM peak_locks p WHERE p.turbine_code = l.turbine_code
+                     )
+                   ORDER BY l.turbine_code, abs(l.yaw_err_deg) DESC, l.id DESC
+                   ON CONFLICT (turbine_code) DO NOTHING
+                   RETURNING turbine_code""",
+                (user["username"], now),
+            ).fetchall()
+            conn.commit()
+            return 200, {"locked": [r["turbine_code"] for r in inserted]}
+
+    status, payload = await run_db(do_lock)
+    return jsonify(payload), status
